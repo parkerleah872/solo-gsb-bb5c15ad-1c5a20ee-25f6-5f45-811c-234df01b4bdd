@@ -153,6 +153,32 @@ class AmbiguityReviewResponse(BaseModel):
     )
 
 
+class VerificationFrameOut(BaseModel):
+    position: int = Field(..., description="扫描顺序位置，从 1 开始")
+    id: FrameId
+    expected_frame_number: int = Field(
+        ..., description="核验通过时应确认的帧号（即基准指派帧号）"
+    )
+
+
+class VerificationPlanResponse(BaseModel):
+    first: int
+    last: int
+    max_missing_between: int
+    frame_count: int
+    total_cost: Union[int, float] = Field(
+        ..., description="与逐帧复核一致的全局最低代价"
+    )
+    assigned_frame_numbers: list[int] = Field(
+        ..., description="基准指派：字典序最小的最低代价帧号序列"
+    )
+    verification_count: int = Field(..., description="人工核验帧的最少数量")
+    verification_frames: list[VerificationFrameOut] = Field(
+        ...,
+        description="最少人工核验帧（position 升序）；最优解唯一时为空数组",
+    )
+
+
 class StripAssignmentOut(BaseModel):
     index: int = Field(..., description="胶片条序号，从 1 开始（条间顺序固定）")
     direction: Literal[0, 1] = Field(

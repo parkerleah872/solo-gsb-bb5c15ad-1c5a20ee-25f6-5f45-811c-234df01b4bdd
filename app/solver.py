@@ -27,6 +27,15 @@ source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互�
 据此给出每帧在**所有**最优合法序列中可取得的帧号集合，而不是仅回溯出
 字典序最小的一条。
 
+人工核验计划（:func:`solve_verification_plan`）把全部最优合法序列看作
+DAG：顶点为出现在某条最优序列中的 (帧, 帧号)，边为最优转移。相对基准
+指派（字典序最小的最优序列）求所有“分叉-汇合”区间：若存在一条最优路径
+在基准位置 a 处分叉、位置 b 处汇合且中间不经过基准路径，则核验集必须
+命中 (a, b) 内部的某个位置，否则该分叉路径就是一条与核验结果相容的
+其他最优序列；反之命中所有此类区间即可排除全部其他最优序列。于是最少
+核验帧数 = 区间族的最小命中集（经典贪心），数量相同时按位置序列字典序
+最小逐位构造。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -60,6 +69,7 @@ source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互�
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import deque
 from decimal import Decimal
 from typing import Any
@@ -676,6 +686,215 @@ def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:
         "total_cost": _json_number(total_cost),
         "frames": result_frames,
         "review_checklist": review_checklist,
+    }
+
+
+# ---- 人工核验计划 ----
+
+
+def _bypass_intervals(
+    n: int,
+    possible: list[list[int]],
+    baseline: list[int],
+    max_step: int,
+    penalty_scaled: int,
+    match_cost: Any,
+    suffix_layers: list[dict[int, int]],
+) -> list[tuple[int, int]]:
+    """求相对基准路径的全部分叉-汇合区间，并过滤为包含关系极小的反链。
+
+    区间 (a, b)（位置下标，b >= a + 2）表示：存在一条最优路径从基准顶点
+    (a, baseline[a]) 分叉、在 (b, baseline[b]) 汇合，且中间位置 a+1..b-1
+    全部不经过基准路径。核验集必须命中每个此类区间的内部，否则该分叉
+    路径就是一条与核验结果相容的其他最优序列。
+
+    实现：在最优路径 DAG 上按位置递推位掩码。src[d] 的第 a 位置位表示
+    存在一条从 (a, baseline[a]) 出发、中间不经过基准顶点的最优路径到达
+    当前位置的非基准顶点 d；路径汇入基准顶点 (k, baseline[k]) 时，掩码
+    中的每个 a 都产生区间 (a, k)。对每个分叉点 a 只保留最早的汇合点
+    （更晚的区间包含它，必然被命中），再过滤为左右端点均严格递增的
+    极小反链。
+    """
+    prev_possible = possible[0]
+    prev_src: dict[int, int] = {}
+    first_merge: dict[int, int] = {}  # 分叉位置 a -> 最早汇合位置
+
+    for k in range(1, n):
+        base_prev = baseline[k - 1]
+        base_curr = baseline[k]
+        suffix_prev = suffix_layers[k - 1]
+        suffix_curr = suffix_layers[k]
+        curr_src: dict[int, int] = {}
+        merge_mask = 0
+        for d in possible[k]:
+            suffix_d = suffix_curr[d]
+            mask = 0
+            for d2 in prev_possible:
+                step = d - d2
+                if step < 1:
+                    break  # prev_possible 升序，之后的前驱只会更大
+                if step > max_step:
+                    continue
+                suffix_d2 = suffix_prev.get(d2)
+                if suffix_d2 is None:
+                    continue
+                # 边 (k-1, d2) -> (k, d) 在某条最优路径上
+                if (
+                    suffix_d2
+                    != match_cost(k - 1, d2)
+                    + penalty_scaled * (step - 1)
+                    + suffix_d
+                ):
+                    continue
+                if d2 == base_prev:
+                    mask |= 1 << (k - 1)  # 在 k-1 处刚从基准路径分叉
+                else:
+                    mask |= prev_src.get(d2, 0)
+            if d == base_curr:
+                # 汇入基准顶点；直接基准边 (k-1 -> k) 对应空区间，剔除
+                merge_mask = mask & ~(1 << (k - 1))
+            else:
+                curr_src[d] = mask
+        # k 递增扫描，首次记录的汇合点即该分叉点的最早汇合点
+        while merge_mask:
+            bit = merge_mask & -merge_mask
+            first_merge.setdefault(bit.bit_length() - 1, k)
+            merge_mask ^= bit
+        prev_possible = possible[k]
+        prev_src = curr_src
+
+    # 过滤为极小反链：(a, b) 被保留当且仅当不存在 a' > a 使 f(a') <= f(a)
+    intervals: list[tuple[int, int]] = []
+    min_merge: int | None = None
+    for a in sorted(first_merge, reverse=True):
+        b = first_merge[a]
+        if min_merge is None or b < min_merge:
+            intervals.append((a, b))
+            min_merge = b
+    intervals.reverse()
+    return intervals
+
+
+def _min_hitting_positions(intervals: list[tuple[int, int]]) -> list[int]:
+    """求命中全部区间的最少位置集合；数量相同时取位置序列字典序最小。
+
+    区间为按左端点（右端点同步）严格递增的反链 (a, b)，可选择的命中点
+    为其整数内部点 a+1 .. b-1。先用经典贪心（取区间最右内部点）自右
+    向左求出每个后缀的最少命中点数，再自左向右逐位构造：每一步在首个
+    未命中区间的内部从小到大取第一个仍能用剩余预算完成命中的点。
+    """
+    r = len(intervals)
+    if r == 0:
+        return []
+    lefts = [iv[0] for iv in intervals]
+    rights = [iv[1] for iv in intervals]
+
+    # suffix_need[j] = 命中区间 j..r-1 所需的最少点数
+    suffix_need = [0] * (r + 1)
+    for j in range(r - 1, -1, -1):
+        # 贪心点 rights[j] - 1 命中所有左端点小于它的后续区间
+        nxt = bisect_left(lefts, rights[j] - 1, j)
+        suffix_need[j] = 1 + suffix_need[nxt]
+
+    chosen: list[int] = []
+    start = 0
+    budget = suffix_need[0]
+    while budget > 0:
+        # 下一个命中点必须落在首个未命中区间 (lefts[start], rights[start])
+        # 内：否则该区间只能由更晚的点命中，而区间内部点都小于它，矛盾。
+        for p in range(lefts[start] + 1, rights[start]):
+            # p 命中后缀中左端点 < p 的所有区间（右端点递增，必然 > p）
+            nxt = bisect_left(lefts, p, start)
+            if suffix_need[nxt] == budget - 1:
+                chosen.append(p)
+                start = nxt
+                budget -= 1
+                break
+        else:  # 防御性检查：贪心点 rights[start]-1 必然可行
+            raise NoFeasibleSequenceError("无法构造最少核验位置集合")
+    return chosen
+
+
+def solve_verification_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """规划最少人工核验帧，使基准指派成为唯一与核验相容的最优序列。
+
+    入参与 :func:`solve_review` 完全相同（复用同一请求校验、代价规则与
+    DP）。基准指派为逐帧复核给出的字典序最小的最低代价序列。若一组扫描
+    帧核验后的真实帧号与基准指派一致时，所有其他同代价合法序列都被
+    排除，则称这组帧为有效核验集；本接口返回帧数最少、数量相同时位置
+    序列字典序最小的有效核验集，而不是简单地把全部歧义帧列入计划。
+
+    全部最优合法序列构成一个 DAG（顶点为出现在某条最优序列中的
+    (帧, 帧号)，边为最优转移）。相对基准路径的每个分叉-汇合区间都
+    必须在内部至少核验一帧，否则该分叉路径就是一条与核验结果相容的
+    其他最优序列；反之命中所有区间即可排除全部其他最优序列。最少
+    核验帧数即区间族的最小命中集。最优解唯一时无分叉区间，返回空
+    计划。错误语义与 solve_review 相同。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+
+    n = solution["n"]
+    total_cost_scaled = solution["total_cost"]
+    scale = solution["cost_scale"]
+    prefix_layers = solution["prefix_layers"]
+    suffix_layers = solution["suffix_layers"]
+    match_cost = solution["match_cost_fn"]
+    baseline_offsets = solution["offsets"]
+    max_step = gap + 1
+    penalty_scaled = MISSING_FRAME_PENALTY * scale
+
+    # 每帧在所有最优合法序列中的可取偏移（与歧义核验同一判定等式，
+    # 键顺序天然升序），即最优路径 DAG 在各位置的顶点集
+    possible: list[list[int]] = []
+    for i in range(n):
+        layer: list[int] = []
+        for d, prefix_cost in prefix_layers[i].items():
+            suffix_cost = suffix_layers[i].get(d)
+            if suffix_cost is None:
+                continue
+            if prefix_cost + suffix_cost - match_cost(i, d) == total_cost_scaled:
+                layer.append(d)
+        possible.append(layer)
+
+    intervals = _bypass_intervals(
+        n,
+        possible,
+        baseline_offsets,
+        max_step,
+        penalty_scaled,
+        match_cost,
+        suffix_layers,
+    )
+    plan_indices = _min_hitting_positions(intervals)
+
+    baseline_numbers = [first + d for d in baseline_offsets]
+    verification_frames = [
+        {
+            "position": idx + 1,
+            "id": parsed[idx][0],
+            "expected_frame_number": baseline_numbers[idx],
+        }
+        for idx in plan_indices
+    ]
+
+    total_cost = Decimal(total_cost_scaled) / scale
+    return {
+        "first": first,
+        "last": last,
+        "max_missing_between": gap,
+        "frame_count": n,
+        "total_cost": _json_number(total_cost),
+        "assigned_frame_numbers": baseline_numbers,
+        "verification_count": len(verification_frames),
+        "verification_frames": verification_frames,
     }
 
 

@@ -17,9 +17,14 @@
 最优解，而是给出**每帧在所有最低代价合法序列中可取得的帧号**，并把不能
 唯一确定帧号的帧整理成核验清单，供人工逐条确认。
 
+另有人工核验计划接口：同样沿用逐帧复核的请求与代价规则，以字典序最小
+的最低代价指派为**基准**，利用最优路径的**分叉与汇合**关系求出**最少的
+人工核验帧**——只要这些帧的真实帧号与基准一致，其他所有同代价合法序列
+都被排除；返回基准帧号序列与每个核验帧的位置、ID、预期帧号。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
-  + 复扫窗口划分动态规划
+  + 复扫窗口划分动态规划 + 最优路径 DAG 分叉-汇合区间的最小命中集
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -31,13 +36,14 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用四个接口：
+`8000`。启动后可直接使用五个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，四个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，五个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
 - 歧义核验：`POST http://localhost:8000/api/v1/ambiguity-reviews`
+- 人工核验计划：`POST http://localhost:8000/api/v1/verification-plans`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 
@@ -54,6 +60,7 @@ docker compose down
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
 | `POST` | `/api/v1/ambiguity-reviews` | 歧义核验：每帧在所有最低代价合法序列中的可取帧号 |
+| `POST` | `/api/v1/verification-plans` | 人工核验计划：锁定基准指派所需的最少核验帧 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 
@@ -240,6 +247,84 @@ curl -s -X POST http://localhost:8000/api/v1/ambiguity-reviews \
   帧号；全部帧都唯一时为空数组。
 - 无合法序列时沿用逐帧复核的 HTTP `422` 响应，错误码为
   `invalid_range` / `no_feasible_sequence`，结构同上。
+
+### `POST /api/v1/verification-plans`
+
+在歧义核验之上更进一步：不是把所有歧义帧都列入人工核验，而是求出**最少
+的人工核验帧集合**——以逐帧复核给出的字典序最小的最低代价指派为**基准
+指派**，只要核验集里这些帧的真实帧号都与基准一致，其他所有同代价合法
+序列就都被排除，基准指派即被唯一锁定。
+
+**请求体与逐帧复核完全相同**（同样的 `first` / `last` /
+`max_missing_between` / `frames` 字段与校验规则，可直接复用逐帧复核的
+请求 JSON），首末帧固定、相邻缺帧上限、候选/缺帧代价与全局最优规则也
+完全一致。
+
+#### 核验集的求解规则
+
+- 全部最低代价合法序列构成一个 DAG：顶点为出现在某条最优序列中的
+  （帧，帧号），边为最优转移；基准指派是其中字典序最小的一条路径；
+- 若某条最优路径在基准位置 `a` 处**分叉**、位置 `b` 处**汇合**且中间不
+  经过基准路径，则核验集必须命中 `(a, b)` 内部的某个位置，否则这条分叉
+  路径就是一条与核验结果相容的其他最优序列；反之，命中所有此类
+  分叉-汇合区间即可排除全部其他最优序列；
+- 因此最少核验帧数 = 全部分叉-汇合区间的**最小命中集**（区间族先过滤为
+  极小反链，再用经典贪心求最小点数）；数量相同时取**核验位置序列字典序
+  最小**的计划；
+- 最优解唯一时没有任何分叉区间，返回空计划（`verification_count = 0`）；
+- 错误语义与逐帧复核一致：参数非法返回 `invalid_range`、约束下无合法
+  序列返回 `no_feasible_sequence`（均为 HTTP `422`）。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/verification-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 20,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 99}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 13, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": []},
+      {"id": "scan-005", "candidates": [{"frame_number": 17, "confidence": 90}]},
+      {"id": "scan-006", "candidates": [{"frame_number": 20, "confidence": 99}]}
+    ]
+  }'
+```
+
+#### 响应示例
+
+该例中 `scan-003` 可取 14/15、`scan-004` 可取 15/16（歧义清单共 2 帧），
+但最优序列只有 `[10,13,14,15,17,20]`、`[10,13,14,16,17,20]`、
+`[10,13,15,16,17,20]` 三条：只要核验 `scan-004` 的真实帧号确为 15，
+后两条即被排除，故最少核验帧数为 1，而不是把 2 个歧义帧全部列入计划。
+
+```json
+{
+  "first": 10,
+  "last": 20,
+  "max_missing_between": 2,
+  "frame_count": 6,
+  "total_cost": 372,
+  "assigned_frame_numbers": [10, 13, 14, 15, 17, 20],
+  "verification_count": 1,
+  "verification_frames": [
+    {"position": 4, "id": "scan-004", "expected_frame_number": 15}
+  ]
+}
+```
+
+字段说明：
+
+- `assigned_frame_numbers`：基准指派，即逐帧复核给出的字典序最小的最低
+  代价帧号序列；`total_cost` 为与逐帧复核一致的全局最低代价；
+- `verification_count` / `verification_frames`：最少人工核验帧的数量与
+  清单（按 `position` 升序），每项含扫描位置、帧 `id` 与预期帧号
+  `expected_frame_number`（即基准指派帧号）；最优解唯一时
+  `verification_count = 0`、`verification_frames` 为空数组。
 
 ### `POST /api/v1/strip-direction-reviews`
 
@@ -530,6 +615,15 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   （拼接处的 match 代价被前缀、后缀各计一次，故减去一份）。枚举满足该
   等式的偏移即得到每帧的全部可取帧号，比较全程在整数缩放域完成，小数
   置信分的同分判定与逐帧复核完全一致；
+- 人工核验计划（`/api/v1/verification-plans`）把全部最优合法序列看作
+  DAG：顶点为满足上述等式的 (帧, 偏移)，边为满足
+  `suffix[i][d] = match(i,d) + 30·(d'-d-1) + suffix[i+1][d']` 的最优
+  转移——DAG 上从 (0, `first`) 到 (n-1, `last`) 的每条路径都恰好对应一条
+  最低代价合法序列。相对基准路径（字典序最小的最优序列）按位置递推位
+  掩码，求出所有“在位置 a 分叉、位置 b 汇合且中间不经过基准路径”的
+  区间：核验集有效当且仅当命中每个此类区间的内部。区间族过滤为极小
+  反链后，最小命中集大小由经典贪心（取最右内部点）求得，字典序最小的
+  最小命中集再借助后缀贪心计数逐位构造；整体复杂度 O(n·span·max_step)；
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。
