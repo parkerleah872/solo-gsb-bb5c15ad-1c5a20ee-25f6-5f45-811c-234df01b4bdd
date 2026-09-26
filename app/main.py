@@ -14,6 +14,7 @@ from app.schemas import (
     ReviewResponse,
     StripDirectionReviewRequest,
     StripDirectionReviewResponse,
+    VerificationPlanResponse,
 )
 from app.solver import (
     InvalidRangeError,
@@ -23,6 +24,7 @@ from app.solver import (
     solve_rescan_plan,
     solve_review,
     solve_strip_directions,
+    solve_verification_plan,
 )
 
 app = FastAPI(
@@ -36,8 +38,11 @@ app = FastAPI(
         "划分成固定成本加长度计费的连续窗口，求最低总成本方案。"
         "歧义核验接口则返回每帧在所有最低代价合法序列中可取得的帧号，"
         "供人工确认尚不能唯一确定帧号的扫描帧。"
+        "核验计划接口进一步给出最少的人工核验帧集合：这些帧的真实帧号若均"
+        "与基准（字典序最小的最低代价）指派一致，其余同代价合法序列即被"
+        "全部排除。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -98,6 +103,18 @@ async def review_frames(request: ReviewRequest) -> ReviewResponse:
 async def review_ambiguity(request: ReviewRequest) -> AmbiguityReviewResponse:
     result = solve_ambiguity_review(request.model_dump())
     return AmbiguityReviewResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/verification-plans",
+    response_model=VerificationPlanResponse,
+    tags=["review"],
+    summary="规划使基准指派唯一确定的最少人工核验帧",
+    responses={422: {"model": ErrorResponse, "description": "参数非法或无合法序列"}},
+)
+async def plan_verification(request: ReviewRequest) -> VerificationPlanResponse:
+    result = solve_verification_plan(request.model_dump())
+    return VerificationPlanResponse.model_validate(result)
 
 
 @app.post(

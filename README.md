@@ -17,9 +17,14 @@
 最优解，而是给出**每帧在所有最低代价合法序列中可取得的帧号**，并把不能
 唯一确定帧号的帧整理成核验清单，供人工逐条确认。
 
+另有核验计划接口：以字典序最小的最低代价指派为基准，利用最优路径的
+分叉/汇合关系求**最少的人工核验帧集合**——这些帧的真实帧号若均与基准
+一致，其余所有同代价合法序列即被全部排除；数量相同时取核验位置序列
+字典序最小者，唯一最优解返回空计划。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
-  + 复扫窗口划分动态规划
+  + 复扫窗口划分动态规划 + 最优路径 DAG 分叉/汇合分析（区间最少点集）
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -31,13 +36,14 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用四个接口：
+`8000`。启动后可直接使用五个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，四个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，五个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
 - 歧义核验：`POST http://localhost:8000/api/v1/ambiguity-reviews`
+- 核验计划：`POST http://localhost:8000/api/v1/verification-plans`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 
@@ -54,6 +60,7 @@ docker compose down
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
 | `POST` | `/api/v1/ambiguity-reviews` | 歧义核验：每帧在所有最低代价合法序列中的可取帧号 |
+| `POST` | `/api/v1/verification-plans` | 核验计划：使基准指派唯一确定的最少人工核验帧 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 
@@ -240,6 +247,91 @@ curl -s -X POST http://localhost:8000/api/v1/ambiguity-reviews \
   帧号；全部帧都唯一时为空数组。
 - 无合法序列时沿用逐帧复核的 HTTP `422` 响应，错误码为
   `invalid_range` / `no_feasible_sequence`，结构同上。
+
+### `POST /api/v1/verification-plans`
+
+在歧义核验之上进一步回答“至少人工确认哪几帧，才能让基准方案成为唯一
+最优解”。**请求体与逐帧复核完全相同**（同样的 `first` / `last` /
+`max_missing_between` / `frames` 字段与校验规则），代价规则、全局最优
+与字典序裁决也完全一致。
+
+以逐帧复核的结果（字典序最小的最低代价指派）为**基准**：若核验集合中各
+帧的真实帧号均等于基准指派，则其余所有同代价合法序列都被排除，基准成
+为唯一最优序列。接口返回满足该条件的**最少**核验帧集合；最少数量相同
+时取核验位置序列字典序最小者。注意核验集合通常小于歧义核验给出的全部
+歧义帧——利用最优路径的分叉/汇合关系，一次核验可以同时排除多条歧义
+路径，因此不会简单地把全部歧义帧列入计划。最优解唯一时返回空计划。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/verification-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 16,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 11, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 16, "confidence": 85}]}
+    ]
+  }'
+```
+
+#### 响应示例
+
+该例有两条同代价（220）最优序列 `[10, 11, 13, 16]` 与 `[10, 11, 14, 16]`，
+基准为前者；只需人工核验第 3 帧（确认其为 13），后者即被排除。
+
+```json
+{
+  "first": 10,
+  "last": 16,
+  "max_missing_between": 2,
+  "frame_count": 4,
+  "total_cost": 220,
+  "assigned_frame_numbers": [10, 11, 13, 16],
+  "verification_count": 1,
+  "verification_frames": [
+    {"position": 3, "id": "scan-003", "expected_frame_number": 13}
+  ]
+}
+```
+
+字段说明：
+
+- `assigned_frame_numbers`：基准（字典序最小的最低代价）指派帧号序列，
+  与逐帧复核的结果一致；
+- `verification_count` / `verification_frames`：最少核验帧数及核验清单
+  （按扫描位置升序），每项含 `position`、帧 `id` 与人工核验时应得到的
+  预期帧号 `expected_frame_number`（即基准指派值）；最优解唯一时
+  `verification_count` 为 0、`verification_frames` 为空数组；
+- `total_cost`：与逐帧复核一致的全局最低代价；
+- 非法输入与无合法序列时沿用逐帧复核的 HTTP `422` 响应，错误码为
+  `invalid_range` / `no_feasible_sequence`，结构同上。
+
+#### 核验集合为什么可以小于歧义帧集合
+
+5 帧全部无候选（`first=0`、`last=8`、`max_missing_between=2`）时，歧义
+核验会列出第 2、3、4 帧共 3 个歧义帧，但最优路径在第 3 帧处分叉后必然
+于后续层汇合，核验第 3 帧（预期帧号 2）即可同时排除所有绕行路径：
+
+```json
+{
+  "first": 0,
+  "last": 8,
+  "max_missing_between": 2,
+  "frame_count": 5,
+  "total_cost": 620,
+  "assigned_frame_numbers": [0, 1, 2, 5, 8],
+  "verification_count": 1,
+  "verification_frames": [
+    {"position": 3, "id": "scan-003", "expected_frame_number": 2}
+  ]
+}
+```
 
 ### `POST /api/v1/strip-direction-reviews`
 
@@ -533,6 +625,25 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
 - 胶片条方向复核把每条按候选方向翻转后拼接（条间顺序不变），对每个方向
   向量跑一次上述 DP，再按“总代价 → 倒序条数 → 方向向量 → 帧号序列”
   逐级取字典序最小。
+
+核验计划（`solve_verification_plan`）：
+
+- 全部最优合法序列构成一个 DAG：节点为满足
+  `prefix[i][d] + suffix[i][d] - match(i,d) = 全局最优` 的 `(i, d)`，边为
+  紧转移边；DAG 上每条 s-t 路径都是一条最优序列，反之亦然；
+- 任一非基准最优路径与基准路径（字典序最小最优解）的差异层是若干极大
+  区间，每个区间对应一次“从基准层 a 分叉、在基准层 c 汇合、中间不经过
+  基准节点”的绕行；核验集合合法 ⟺ 每个分叉区间 `(a, c)` 内都有被核验
+  的层（否则该绕行拼上基准首尾即得一条逃过全部核验的最优路径）；
+- 自右向左在 DAG 上递推 `f(v)` = 从 v 出发、中间不经过基准节点、最近能
+  汇合回基准路径的层号；分叉点 a 的最早汇合层 `g(a)` 即第一步离开基准
+  节点的紧边后继的 f 值最小者。每个分叉区间都包含某个 `[a+1, g(a)-1]`，
+  故问题化为对这 O(n) 个区间求**最少点集**（经典按右端点贪心），复杂度
+  O(n · span · max_step)；
+- 数量相同时取核验位置序列字典序最小：已确定的最大核验层为 t 时，下一
+  位取 `(t, 剩余区间最早右端点]` 内第一个使“左端点大于它的区间”的最少
+  击中数恰减 1 的层，逐位构造即得字典序最小的最少核验方案；
+- 最优解唯一时分叉区间为空，返回空核验计划。
 
 复扫窗口规划（`solve_rescan_plan`）：
 

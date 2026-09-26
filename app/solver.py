@@ -27,6 +27,15 @@ source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互�
 据此给出每帧在**所有**最优合法序列中可取得的帧号集合，而不是仅回溯出
 字典序最小的一条。
 
+核验计划（:func:`solve_verification_plan`）以字典序最小的最优指派为基准，
+求最少的人工核验帧集合：这些帧的真实帧号若均与基准一致，则其余所有同代价
+合法序列都被排除（基准成为唯一最优序列）。把全部最优合法序列看成 DAG 上的
+s-t 路径，任何一条非基准路径必然在某个极大区间上"分叉—汇合"地绕开基准路径；
+核验集合只需击中所有分叉区间。利用分叉/汇合结构在 DAG 上自右向左递推每个
+节点"不经过基准节点、最近能汇合回基准路径的层号"，得到每个分叉点的最早汇合
+层，把问题化为区间最少点集，并用"剩余区间最少击中数"逐位构造数量最少且
+位置序列字典序最小的核验方案，而不是简单地把全部歧义帧列入计划。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -676,6 +685,178 @@ def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:
         "total_cost": _json_number(total_cost),
         "frames": result_frames,
         "review_checklist": review_checklist,
+    }
+
+
+def solve_verification_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """求使基准指派成为唯一最优序列的最少人工核验帧集合。
+
+    入参与 :func:`solve_review` 完全相同（复用同一请求校验与 DP），基准为
+    字典序最小的最低代价指派（即逐帧复核的结果）。若核验集合 S 中各帧的
+    真实帧号都等于基准指派，则与基准在这些帧上取值不同的最优序列全部被
+    排除；本函数求使基准成为唯一剩余最优序列的 |S| 最小集合，|S| 相同时
+    取核验位置序列字典序最小者。
+
+    实现思路（最优路径的分叉与汇合）：
+
+    1. 全部最优合法序列 = 最优 DAG 上的全部 s-t 路径：节点为满足
+       ``prefix[i][d] + suffix[i][d] - match(i, d) == 全局最优`` 的 (i, d)，
+       边为紧转移边（``30*(d'-d-1) + suffix[i+1][d'] == suffix[i][d] -
+       match(i, d)``）。DAG 上每条 s-t 路径都是一条最优序列，反之亦然。
+    2. 任一非基准最优路径与基准路径的差异层是若干极大区间，每个区间对应
+       一次"从基准层 a 分叉、在基准层 c 汇合、中间不经过基准节点"的绕行；
+       核验集合 S 合法，当且仅当每个分叉区间 (a, c) 内都有 S 中的层
+       （否则该绕行拼上基准首尾即得一条逃过全部核验的最优路径）。
+    3. 自右向左在 DAG 上递推 f(v) = 从 v 出发、中间不经过基准节点、最近
+       能汇合回基准路径的层号；分叉点 a 的最早汇合层 g(a) 即第一步离开
+       基准节点的紧边后继的 f 值最小者。每个分叉区间都包含某个
+       [a+1, g(a)-1]，故只需对这些 O(n) 个区间求最少点集。
+    4. 区间最少点集用经典贪心求数量；字典序最小方案逐位构造：已确定最大
+       核验层为 t 时，下一位取 (t, 剩余区间最早右端点] 内第一个使"左端点
+       大于它的区间"的最少击中数恰减 1 的层（该层左侧取任何更小的层都不
+       可能用同样数量完成击中）。
+
+    唯一最优解（无歧义帧）时分叉区间为空，返回空核验计划。
+    错误语义同 solve_review。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+
+    n = solution["n"]
+    span = solution["span"]
+    max_step = gap + 1
+    total_cost_scaled = solution["total_cost"]
+    scale = solution["cost_scale"]
+    prefix_layers = solution["prefix_layers"]
+    suffix_layers = solution["suffix_layers"]
+    match_cost = solution["match_cost_fn"]
+    baseline = solution["offsets"]  # 基准：字典序最小的最优偏移序列
+    penalty_scaled = MISSING_FRAME_PENALTY * scale
+
+    # ---- 最优 DAG 节点：每层可出现在某条最优序列中的偏移（同歧义核验判定）----
+    dag_offsets: list[list[int]] = []
+    for i in range(n):
+        layer_nodes = [
+            d
+            for d, prefix_cost in prefix_layers[i].items()
+            if d in suffix_layers[i]
+            and prefix_cost + suffix_layers[i][d] - match_cost(i, d)
+            == total_cost_scaled
+        ]
+        dag_offsets.append(sorted(layer_nodes))
+    dag_sets = [set(layer) for layer in dag_offsets]
+
+    # ---- f(v)：从 v 出发、中间不经过基准节点、最近能汇合回基准路径的层号 ----
+    # 在紧边上按层从右往左递推：
+    #   f(v) = min over 紧边 v->w of (w 是第 c 层基准节点 ? c : f(w))
+    f_layers: list[dict[int, int]] = [dict() for _ in range(n)]
+    for i in range(n - 2, -1, -1):
+        f_layer = f_layers[i]
+        next_set = dag_sets[i + 1]
+        f_next = f_layers[i + 1]
+        suffix_i = suffix_layers[i]
+        suffix_next = suffix_layers[i + 1]
+        next_baseline = baseline[i + 1]
+        for d in dag_offsets[i]:
+            rest = suffix_i[d] - match_cost(i, d)  # 紧边应满足的后续最小代价
+            best: int | None = None
+            upper = min(span, d + max_step)
+            for nd in range(d + 1, upper + 1):
+                if nd not in next_set:
+                    continue
+                if penalty_scaled * (nd - d - 1) + suffix_next[nd] != rest:
+                    continue  # 非紧边：走上它总代价必然超过全局最优
+                if nd == next_baseline:
+                    cand = i + 1  # 下一步即汇合回基准路径
+                else:
+                    cand = f_next.get(nd)
+                    if cand is None:
+                        continue  # 该方向无法再汇合回基准路径
+                if best is None or cand < best:
+                    best = cand
+            if best is not None:
+                f_layer[d] = best
+
+    # ---- 分叉区间：g(a) = 从第 a 层基准节点分叉后最早能汇合回基准的层号 ----
+    # 分叉第一步不能落在第 a+1 层基准节点上（否则不算分叉）；汇合层 c = g(a)
+    # 满足 c >= a+2，区间 [a+1, c-1] 非空。
+    intervals: list[tuple[int, int]] = []  # (左端点, 右端点) 闭区间，0-based 层号
+    for a in range(n - 2):
+        d = baseline[a]
+        rest = suffix_layers[a][d] - match_cost(a, d)
+        suffix_next = suffix_layers[a + 1]
+        next_set = dag_sets[a + 1]
+        f_next = f_layers[a + 1]
+        next_baseline = baseline[a + 1]
+        best: int | None = None
+        upper = min(span, d + max_step)
+        for nd in range(d + 1, upper + 1):
+            if nd == next_baseline or nd not in next_set:
+                continue
+            if penalty_scaled * (nd - d - 1) + suffix_next[nd] != rest:
+                continue
+            cand = f_next.get(nd)
+            if cand is None:
+                continue
+            if best is None or cand < best:
+                best = cand
+        if best is not None:
+            intervals.append((a + 1, best - 1))
+
+    # ---- 区间最少点集：先求最少数量，再逐位构造位置字典序最小的方案 ----
+    # remaining(q) = 左端点 > q 的区间的最少击中点数（按右端点贪心）
+    def remaining(q: int) -> int:
+        count = 0
+        last_point = q  # 左端点 > q 的区间都不可能被 <= q 的点击中
+        for r, l in sorted((r, l) for l, r in intervals if l > q):
+            if l > last_point:
+                count += 1
+                last_point = r
+        return count
+
+    plan_layers: list[int] = []
+    t = 0  # 已确定的最大核验层（首层固定为 first，区间左端点 >= 1）
+    while True:
+        need = remaining(t)
+        if need == 0:
+            break
+        r_star = min(r for l, r in intervals if l > t)
+        # (t, r_star] 内第一个使剩余最少击中数恰减 1 的层即字典序最小的下一位
+        p = next(
+            cand
+            for cand in range(t + 1, r_star + 1)
+            if remaining(cand) == need - 1
+        )
+        plan_layers.append(p)
+        t = p
+
+    total_cost = Decimal(total_cost_scaled) / scale
+    assigned_numbers = [first + d for d in baseline]
+    verification_frames = [
+        {
+            "position": layer + 1,
+            "id": parsed[layer][0],
+            "expected_frame_number": first + baseline[layer],
+        }
+        for layer in plan_layers
+    ]
+
+    return {
+        "first": first,
+        "last": last,
+        "max_missing_between": gap,
+        "frame_count": n,
+        "total_cost": _json_number(total_cost),
+        "assigned_frame_numbers": assigned_numbers,
+        "verification_count": len(verification_frames),
+        "verification_frames": verification_frames,
     }
 
 
